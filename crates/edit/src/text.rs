@@ -16,7 +16,8 @@ use std::rc::Rc;
 use pdfcraft_content::{Matrix, Op, parse, serialize_ops};
 use pdfcraft_cos::{Dict, Document, Object, PdfString, Stream};
 use pdfcraft_fonts::pdf::Metrics;
-use pdfcraft_fonts::{GlyphError, japanese_glyph};
+use pdfcraft_fonts::shape::{ShapedGlyph, needs_shaping, shape_line, shaped_glyph_outline};
+use pdfcraft_fonts::{GlyphError, bidi, japanese_glyph};
 
 use crate::EditError;
 
@@ -451,7 +452,31 @@ pub fn text_lines(doc: &Document, page: usize) -> Result<Vec<TextLine>, EditErro
                     && s.start_x > end - size
                     && s.start_x - end < size * 3.0
             });
-            if joins && let Some(l) = lines.last_mut() {
+            // Right-to-left text may be shown right to left: each piece to the left of the last.
+            let joins_left = !joins
+                && bidi::has_rtl(&s.text)
+                && last.is_some_and(|(bt, base, _, size)| {
+                    bt == s.bt
+                        && lines.last().is_some_and(|l| {
+                            l.font.as_bytes() == s.font.as_slice()
+                                && (s.size - l.size).abs() < 0.01
+                                && fill_color(&s.state.fill) == l.color
+                                && s.end_x < l.rect[0] + size * 0.5
+                                && l.rect[0] - s.end_x < size * 3.0
+                        })
+                        && (s.baseline - base).abs() < size * 0.3
+                });
+            if joins_left && let Some(l) = lines.last_mut() {
+                let gap = l.rect[0] - s.end_x;
+                let mut text = s.text.clone();
+                if gap > l.size * 0.2 && !l.text.starts_with(' ') && !s.text.ends_with(' ') {
+                    text.push(' ');
+                }
+                l.text.insert_str(0, &text);
+                l.rect = [l.rect[0].min(s.rect[0]), l.rect[1].min(s.rect[1]), l.rect[2].max(s.rect[2]), l.rect[3].max(s.rect[3])];
+                l.ops.push(s.op);
+                l.decodable &= s.decodable;
+            } else if joins && let Some(l) = lines.last_mut() {
                 let gap = s.start_x - last.map_or(s.start_x, |x| x.2);
                 if gap > l.size * 0.2 && !l.text.ends_with(' ') && !s.text.starts_with(' ') {
                     l.text.push(' ');
@@ -492,6 +517,13 @@ pub fn text_lines(doc: &Document, page: usize) -> Result<Vec<TextLine>, EditErro
     }
     // Lines of only spaces aren't editable text.
     lines.retain(|l| !l.text.trim().is_empty());
+    // Text was gathered in visual order (left to right on the page); right-to-left lines
+    // (Arabic, Hebrew) read in the opposite order, with joined letter forms made letters again.
+    for l in &mut lines {
+        if bidi::has_rtl(&l.text) {
+            l.text = bidi::visual_to_logical(&l.text);
+        }
+    }
     Ok(lines)
 }
 
@@ -635,6 +667,149 @@ fn type3_font(doc: &mut Document, fonts_res: &mut Dict, text: &str) -> Result<Ty
     Ok(Type3Fallback { name, family, codes })
 }
 
+/// A Type 3 font of shaped glyphs (Arabic letters in their joined forms), and the codes that
+/// show each of the lines it was made for.
+#[derive(Clone)]
+struct ShapedFallback {
+    name: String,
+    family: &'static str,
+    lines: HashMap<String, Vec<u8>>,
+}
+
+fn shaping_error(e: GlyphError) -> EditError {
+    match e {
+        GlyphError::NoFont => EditError::Invalid(
+            "this text needs PrintCraft's Arabic font (Noto Sans Arabic), which this build doesn't include \
+             (to build it in, set CRAFT_FONTS_DIR to a craft-fonts checkout that has it)"
+                .into(),
+        ),
+        GlyphError::Missing => EditError::Invalid("the replacement text has a character none of PrintCraft's fonts can show".into()),
+        GlyphError::TooComplex => EditError::Invalid("the replacement text is too long or a glyph is too complex".into()),
+    }
+}
+
+/// The width of `line` shaped, in em (0 when it can't be shaped; [`shaped_font`] reports why).
+fn shaped_width(line: &str, rtl: bool) -> f64 {
+    shape_line(line, rtl).map_or(0.0, |l| l.width)
+}
+
+/// Shape `lines` (one paragraph, direction `rtl`) and add a Type 3 font with their glyphs.
+fn shaped_font(doc: &mut Document, fonts_res: &mut Dict, lines: &[String], rtl: bool) -> Result<ShapedFallback, EditError> {
+    type Key = (pdfcraft_fonts::shape::Face, u32, i64, i64, i64, String);
+    let key = |g: &ShapedGlyph| -> Key {
+        let q = |v: f64| (v * 1000.0).round() as i64;
+        (g.face, g.gid, q(g.x_offset), q(g.y_offset), q(g.advance), g.text.clone())
+    };
+    let mut glyphs: Vec<(Key, ShapedGlyph)> = Vec::new();
+    let mut encoded = HashMap::new();
+    let mut family = pdfcraft_fonts::shape::Face::Latin.family();
+    for line in lines {
+        let shaped = shape_line(line, rtl).map_err(shaping_error)?;
+        let mut bytes = Vec::with_capacity(shaped.glyphs.len());
+        for g in shaped.glyphs {
+            if g.face == pdfcraft_fonts::shape::Face::Arabic {
+                family = g.face.family();
+            }
+            let k = key(&g);
+            let index = match glyphs.iter().position(|(gk, _)| *gk == k) {
+                Some(i) => i,
+                None => {
+                    if glyphs.len() >= MAX_TYPE3_GLYPHS {
+                        return Err(EditError::Invalid("the replacement text has too many different letter shapes for one paragraph".into()));
+                    }
+                    glyphs.push((k, g));
+                    glyphs.len() - 1
+                }
+            };
+            bytes.push(u8::try_from(index + 1).map_err(|_| EditError::Invalid("too many glyphs".into()))?);
+        }
+        encoded.insert(line.clone(), bytes);
+    }
+    if glyphs.is_empty() {
+        return Err(EditError::Invalid("replacement text is empty".into()));
+    }
+    let scale = 1000.0;
+    let mut charprocs = Dict::new();
+    let mut widths = Vec::with_capacity(glyphs.len());
+    let mut differences = vec![Object::Int(1)];
+    let mut font_bbox = [0.0_f64, -300.0, 1000.0, 1000.0];
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapType 2 def\n1 begincodespacerange\n<01> <FF>\nendcodespacerange\n",
+    );
+    let mapped: Vec<(usize, &ShapedGlyph)> = glyphs.iter().enumerate().filter(|(_, (_, g))| !g.text.is_empty()).map(|(i, (_, g))| (i, g)).collect();
+    // bfchar sections hold at most 100 entries each.
+    for chunk in mapped.chunks(100) {
+        cmap.push_str(&format!("{} beginbfchar\n", chunk.len()));
+        for (i, g) in chunk {
+            let hex: String = g.text.chars().map(unicode_hex).collect();
+            cmap.push_str(&format!("<{:02X}> <{hex}>\n", i + 1));
+        }
+        cmap.push_str("endbfchar\n");
+    }
+    for (i, (_, g)) in glyphs.iter().enumerate() {
+        let outline = shaped_glyph_outline(g).map_err(shaping_error)?;
+        let b = outline.bbox.map(|v| v * scale);
+        font_bbox = [font_bbox[0].min(b[0]), font_bbox[1].min(b[1]), font_bbox[2].max(b[2]), font_bbox[3].max(b[3])];
+        let mut path = format!(
+            "{} 0 {} {} {} {} d1\n",
+            pdf_num((outline.width * scale).round()),
+            pdf_num(b[0].floor()),
+            pdf_num(b[1].floor()),
+            pdf_num(b[2].ceil()),
+            pdf_num(b[3].ceil())
+        )
+        .into_bytes();
+        for contour in &outline.contours {
+            let Some(first) = contour.first() else { continue };
+            path.extend_from_slice(format!("{} {} m\n", pdf_num(first[0] * scale), pdf_num(first[1] * scale)).as_bytes());
+            for p in contour.iter().skip(1) {
+                path.extend_from_slice(format!("{} {} l\n", pdf_num(p[0] * scale), pdf_num(p[1] * scale)).as_bytes());
+            }
+            path.extend_from_slice(b"h\n");
+        }
+        if !outline.contours.is_empty() {
+            path.extend_from_slice(b"f\n");
+        }
+        let glyph_name = format!("g{:02X}", i + 1);
+        let mut pd = Dict::new();
+        pd.set(b"Length".to_vec(), path.len() as i64);
+        let proc_ref = doc.add(Object::Stream(Stream::from_raw(pd, path)));
+        charprocs.set(glyph_name.as_bytes().to_vec(), Object::Ref(proc_ref));
+        differences.push(Object::name(&glyph_name));
+        widths.push(Object::Real((outline.width * scale).round()));
+    }
+    cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    let mut cmap_dict = Dict::new();
+    cmap_dict.set(b"Length".to_vec(), cmap.len() as i64);
+    let cmap_ref = doc.add(Object::Stream(Stream::from_raw(cmap_dict, cmap.into_bytes())));
+    let mut encoding = Dict::new();
+    encoding.set(b"Type".to_vec(), Object::name("Encoding"));
+    encoding.set(b"Differences".to_vec(), Object::Array(differences));
+    let mut font = Dict::new();
+    font.set(b"Type".to_vec(), Object::name("Font"));
+    font.set(b"Subtype".to_vec(), Object::name("Type3"));
+    font.set(b"Name".to_vec(), Object::name("PCArabic"));
+    font.set(b"FontBBox".to_vec(), Object::Array(font_bbox.iter().map(|v| Object::Int(v.round() as i64)).collect()));
+    font.set(
+        b"FontMatrix".to_vec(),
+        Object::Array(vec![Object::Real(0.001), Object::Int(0), Object::Int(0), Object::Real(0.001), Object::Int(0), Object::Int(0)]),
+    );
+    font.set(b"FirstChar".to_vec(), Object::Int(1));
+    font.set(b"LastChar".to_vec(), Object::Int(glyphs.len() as i64));
+    font.set(b"Widths".to_vec(), Object::Array(widths));
+    font.set(b"Encoding".to_vec(), Object::Dict(encoding));
+    font.set(b"CharProcs".to_vec(), Object::Dict(charprocs));
+    font.set(b"ToUnicode".to_vec(), Object::Ref(cmap_ref));
+    let mut name = String::from("PCAr");
+    let mut suffix = 0usize;
+    while fonts_res.contains(name.as_bytes()) {
+        suffix = suffix.saturating_add(1);
+        name = format!("PCAr{suffix}");
+    }
+    fonts_res.set(name.as_bytes().to_vec(), Object::Dict(font));
+    Ok(ShapedFallback { name, family, lines: encoded })
+}
+
 fn type3_encode(fallback: &Type3Fallback, text: &str) -> Option<Vec<u8>> {
     text.chars().map(|ch| fallback.codes.iter().find(|(c, _, _)| *c == ch).map(|(_, code, _)| *code)).collect()
 }
@@ -653,7 +828,8 @@ pub fn replace_line(doc: &mut Document, page: usize, line: usize, text: &str) ->
     let first = target.ops[0];
     // The line's own font, when it can show every character.
     let font = fonts_res.get(target.font.as_bytes()).and_then(|f| doc.resolve(f).as_dict().cloned()).map(|d| Metrics::from_dict(doc, &d));
-    let reused = font.as_ref().and_then(|m| m.encode(&text));
+    // Arabic must be shaped (joined letters, right to left): the line's own font can't be reused.
+    let reused = if needs_shaping(&text) { None } else { font.as_ref().and_then(|m| m.encode(&text)) };
     let mut substituted = None;
     let mut replacement: Vec<Op> = Vec::new();
     // ' and " also move to the next line; keep that.
@@ -669,7 +845,15 @@ pub fn replace_line(doc: &mut Document, page: usize, line: usize, text: &str) ->
     match reused {
         Some(bytes) => replacement.push(Op::new("Tj", vec![Object::String(PdfString::literal(bytes))])),
         None => {
-            if needs_type3(&text) {
+            if needs_shaping(&text) {
+                let shaped = shaped_font(doc, &mut fonts_res, std::slice::from_ref(&text), bidi::is_rtl_paragraph(&text))?;
+                let bytes = shaped.lines.get(&text).cloned().ok_or_else(|| EditError::Invalid(format!("\"{text}\" can't be shown")))?;
+                let size = font_size_before(&ops, first).unwrap_or(target.size);
+                replacement.push(Op::new("Tf", vec![Object::name(&shaped.name), pdfcraft_content::num(size)]));
+                replacement.push(Op::new("Tj", vec![Object::String(PdfString::literal(bytes))]));
+                replacement.push(Op::new("Tf", vec![Object::name(&target.font), pdfcraft_content::num(size)]));
+                substituted = Some(format!("{} Type3", shaped.family));
+            } else if needs_type3(&text) {
                 let fallback = type3_font(doc, &mut fonts_res, &text)?;
                 let bytes = type3_encode(&fallback, &text)
                     .ok_or_else(|| EditError::Invalid(format!("\"{text}\" can't be shown by the Japanese fallback")))?;
@@ -898,8 +1082,15 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
     }
     let o_state = ts_state.clone();
     let metrics = fonts_res.get(font_name.as_bytes()).and_then(|f| doc.resolve(f).as_dict().cloned()).map(|d| Metrics::from_dict(doc, &d));
-    let reuse = style.family.is_none() && metrics.as_ref().is_some_and(|m| m.encode(&text).is_some());
-    let type3 = if !reuse && needs_type3(&text) { Some(type3_font(doc, &mut fonts_res, &text)?) } else { None };
+    // Arabic is shaped (joined letters, laid out right to left) into a font of its own; the
+    // paragraph's font can't be reused for it.
+    let shaped = needs_shaping(&text);
+    let rtl = bidi::is_rtl_paragraph(&text);
+    if shaped {
+        shape_line(&text, rtl).map_err(shaping_error)?;
+    }
+    let reuse = !shaped && style.family.is_none() && metrics.as_ref().is_some_and(|m| m.encode(&text).is_some());
+    let type3 = if !reuse && !shaped && needs_type3(&text) { Some(type3_font(doc, &mut fonts_res, &text)?) } else { None };
     // The standard font used when the paragraph's own can't be (chosen, or substituted).
     let (family, bold, italic) = style.family.unwrap_or((source_family(&b.base_font), b.bold, b.italic));
     let std_width = move |s: &str, size: f64| -> f64 {
@@ -919,6 +1110,8 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
         // Capped at the largest page PDF allows (14 400 pt).
         Some(w) if w.is_finite() => w.clamp(size * k, 14_400.0),
         Some(_) => return Err(EditError::Invalid("the paragraph's width must be a number".into())),
+        // Right-to-left: it grows to the left, up to the left margin.
+        None if members.len() == 1 && rtl => (b.rect[2] - b.rect[0]).max(size * k).max(b.rect[2] + dx - (p.crop(doc)[0] + 36.0)),
         None if members.len() == 1 => (b.rect[2] - b.rect[0]).max(size * k).max(p.crop(doc)[2] - 36.0 - (b.rect[0] + dx)),
         None => (b.rect[2] - b.rect[0]).max(size * k),
     };
@@ -933,6 +1126,7 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
                         .sum::<f64>()
                 })
                 .unwrap_or(0.0),
+            _ if shaped => shaped_width(s, rtl) * size + s.chars().count() as f64 * o_state.char_spacing,
             _ if let Some(fallback) = &type3 => {
                 fallback.codes.iter().map(|(ch, _, width)| s.chars().filter(|c| c == ch).count() as f64 * width * size).sum::<f64>()
                     + s.chars().count() as f64 * o_state.char_spacing
@@ -942,10 +1136,15 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
         t * o_state.scale * k
     };
     let wrapped = wrap(&text, width + 0.5, advance);
+    let shaped_fallback = if shaped { Some(shaped_font(doc, &mut fonts_res, &wrapped, rtl)?) } else { None };
     let mut substituted = None;
     let new_font = !reuse;
     let (show_font, encode): (String, Encoder) = if let Some(m) = metrics.clone().filter(|_| reuse) {
         (font_name.clone(), Box::new(move |s: &str| m.encode(s)))
+    } else if let Some(fallback) = shaped_fallback {
+        substituted = Some(format!("{} Type3", fallback.family));
+        let name = fallback.name.clone();
+        (name, Box::new(move |s: &str| fallback.lines.get(s).cloned()))
     } else if let Some(fallback) = type3.clone() {
         let name = fallback.name.clone();
         let encoder = fallback.clone();
@@ -999,18 +1198,25 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
     }
     block_ops.extend(state.ops());
     block_ops.push(Op::new("Tm", o.tm.iter().map(|v| n(*v)).collect()));
+    // A right-to-left paragraph keeps its right edge: the box starts `width` to the left of it
+    // (when the text runs along the page's x axis), and it is right-aligned unless asked otherwise.
+    let tm_user = Matrix(o.tm).then(&Matrix(o.ctm)).0;
+    let upright = tm_user[1].abs() < 1e-6 * tm_user[0].abs().max(1e-9) && tm_user[2].abs() < 1e-6 * tm_user[3].abs().max(1e-9) && tm_user[0] > 0.0;
+    let start = if rtl && upright { (b.rect[2] - width - o.x) / k } else { 0.0 };
+    let align = style.align.or(if rtl { Some(crate::added::Align::Right) } else { None });
     // Alignment: each line's offset from the left edge, in text space.
     let offset = |line: &str| -> f64 {
         let free = (width - advance(line)).max(0.0) / k;
-        match style.align {
-            Some(crate::added::Align::Center) => free / 2.0,
-            Some(crate::added::Align::Right) => free,
-            _ => 0.0,
-        }
+        start
+            + match align {
+                Some(crate::added::Align::Center) => free / 2.0,
+                Some(crate::added::Align::Right) => free,
+                _ => 0.0,
+            }
     };
     // Justify: word spacing (single-byte code 32 only) so each line but the last fills the width.
     let single_byte = !reuse || metrics.as_ref().is_some_and(|m| !m.composite);
-    let justify = style.align == Some(crate::added::Align::Justify) && single_byte;
+    let justify = align == Some(crate::added::Align::Justify) && single_byte;
     let mut x = 0.0;
     let mut tw_set = 0.0;
     let mut underlines: Vec<(f64, f64, f64)> = Vec::new(); // (x0, x1, y) in text space

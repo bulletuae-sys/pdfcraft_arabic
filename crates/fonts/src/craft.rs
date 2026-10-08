@@ -65,6 +65,19 @@ fn order_cjk<'a>(faces: impl IntoIterator<Item = &'a CraftFont>, prefer_hans: bo
     out
 }
 
+/// The `Arab` craft-fonts faces (Noto Sans Arabic) for Arabic interface text, in manifest
+/// order. Empty without craft-fonts (Arabic then shows the font system's replacement glyph).
+pub fn ui_arabic_fonts() -> Vec<&'static CraftFont> {
+    CRAFT_FONTS.iter().filter(|f| f.covers("Arab")).collect()
+}
+
+/// The face for Arabic text written into PDFs: the first regular `Arab` face (Noto Sans
+/// Arabic). `None` without craft-fonts.
+pub fn document_arabic_font() -> Option<&'static CraftFont> {
+    let arab = || CRAFT_FONTS.iter().filter(|f| f.covers("Arab"));
+    arab().find(|f| f.style == "Regular").or_else(|| arab().next())
+}
+
 /// The face for Japanese text written into PDFs (serif document text): Shippori Mincho, then
 /// BIZ UDMincho, then any other regular `Jpan` face. `None` without craft-fonts.
 pub fn document_japanese_font() -> Option<&'static CraftFont> {

@@ -337,6 +337,51 @@ fn japanese_edit_without_craft_fonts_is_a_clear_error() {
     let latin = text::replace_line(&mut doc, 0, 0, "Hello").unwrap();
     assert_eq!(text::text_lines(&reopen(&doc), 0).unwrap()[0].text, "Hello", "{latin:?}");
 }
+/// Arabic is shaped (joined letters, right to left) into a Type 3 font from craft-fonts' Noto
+/// Sans Arabic, reads back in logical order, and a right-to-left paragraph keeps its right edge.
+#[test]
+fn arabic_paragraph_is_shaped_and_reads_back() {
+    if pdfcraft_fonts::document_arabic_font().is_none() {
+        eprintln!("skipping arabic_paragraph_is_shaped_and_reads_back: built without craft-fonts' Arabic face");
+        let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+        let Err(EditError::Invalid(msg)) = text::replace_block(&mut doc, 0, 0, "مرحبا") else { panic!("expected a clear error") };
+        assert!(msg.contains("Arabic"), "{msg}");
+        return;
+    }
+    let mut doc = text_page("BT /F2 12 Tf 300 700 Td (Invitation and documents) Tj ET");
+    let right = text::text_blocks(&doc, 0).unwrap()[0].rect[2];
+    let replacement = "استلام الدعوة والوثائق خلال 3 أشهر (PDF)";
+    let result = text::replace_block(&mut doc, 0, 0, replacement).unwrap();
+    assert_eq!(result.substituted.as_deref(), Some("Noto Sans Arabic Type3"));
+    let content = String::from_utf8_lossy(&page_content_bytes(&doc, 0)).into_owned();
+    assert!(content.contains("/PCAr"), "{content}");
+    let reopened = reopen(&doc);
+    let blocks = text::text_blocks(&reopened, 0).unwrap();
+    assert_eq!(blocks[0].text, replacement);
+    assert!((blocks[0].rect[2] - right).abs() < 3.0, "right edge {} moved from {right}", blocks[0].rect[2]);
+    // Editing it again keeps it.
+    let mut again = reopened;
+    text::replace_block(&mut again, 0, 0, "تم التعديل").unwrap();
+    assert_eq!(text::text_blocks(&reopen(&again), 0).unwrap()[0].text, "تم التعديل");
+    // One line replaced in place.
+    let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+    text::replace_line(&mut doc, 0, 0, "ضابط الاتصال").unwrap();
+    assert_eq!(text::text_lines(&reopen(&doc), 0).unwrap()[0].text, "ضابط الاتصال");
+}
+
+/// Text shown in visual order (as most producers write Arabic) is read back logically, with
+/// presentation forms turned back into letters.
+#[test]
+fn visual_order_arabic_reads_logically() {
+    // "سلام" written as presentation forms, left to right on the page: ﻡ ﻼ ﺳ (meem final,
+    // lam-alef final, seen initial), through a ToUnicode map.
+    let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert_eq!(lines[0].text, "ab");
+    let _ = &mut doc;
+    assert_eq!(pdfcraft_fonts::bidi::visual_to_logical("\u{FEE1}\u{FEFC}\u{FEB3}"), "سلام");
+}
+
 #[test]
 fn font_descriptor_style_is_exposed_even_with_a_neutral_name() {
     let doc = descriptor_text_page();

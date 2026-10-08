@@ -12,3 +12,8 @@ workspace = true
 pdfcraft-cos = { workspace = true }
 # Glyph outlines of the bundled script font (typed signatures); already in the tree via egui.
 skrifa = "0.44"
+# Arabic text written into PDFs: shaping (already in the tree via egui), the bidi algorithm and
+# presentation-form normalization (both already in the tree via stringprep).
+harfrust = "0.12"
+unicode-bidi = "0.3"
+unicode-normalization = "0.1"

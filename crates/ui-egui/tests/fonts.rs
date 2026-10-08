@@ -112,3 +112,43 @@ fn primary_ui_fonts_cover_latin_catalogs() {
         }
     }
 }
+
+/// Built with craft-fonts' Noto Sans Arabic, Arabic interface text has real glyphs, joined
+/// letters and right-to-left order: the first letter is on the right, the cursor before it at
+/// its right edge, and clicking left of the text puts the cursor at its end.
+#[test]
+fn arabic_ui_text_is_shaped_right_to_left() {
+    if pdfcraft_fonts::ui_arabic_fonts().is_empty() {
+        eprintln!("skipping arabic_ui_text_is_shaped_right_to_left: built without craft-fonts' Arabic face");
+        return;
+    }
+    let text = "استلام الدعوة";
+    let n = text.chars().count();
+    let mut fonts = Fonts::new(TextOptions::default(), theme::font_definitions());
+    for id in families() {
+        assert!(fonts.has_glyphs(&id, text), "{id:?} lacks Arabic");
+    }
+    let mut view = fonts.with_pixels_per_point(2.0);
+    let galley = view.layout_no_wrap(text.to_owned(), FontId::proportional(13.0), Color32::BLACK);
+    let row = &galley.rows[0];
+    assert_eq!(row.glyphs.len(), n, "one glyph per char");
+    // Logical first char (ا) is right of the last (ة); the first word is right of the second.
+    assert!(row.glyphs[0].pos.x > row.glyphs[n - 1].pos.x);
+    assert!(row.glyphs[1].pos.x > row.glyphs[8].pos.x);
+    let before_first = galley.pos_from_cursor(egui::text::CCursor::new(0)).min.x;
+    let at_end = galley.pos_from_cursor(egui::text::CCursor::new(n)).min.x;
+    assert!(before_first > at_end + 20.0, "{before_first} vs {at_end}");
+    assert_eq!(galley.cursor_from_pos(egui::vec2(-5.0, 5.0)).index, egui::text::CharIndex(n));
+    assert_eq!(galley.cursor_from_pos(egui::vec2(galley.size().x + 5.0, 5.0)).index, egui::text::CharIndex(0));
+    // Joined forms are narrower than the same letters isolated.
+    let isolated: f32 = text
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| view.layout_no_wrap(c.to_string(), FontId::proportional(13.0), Color32::BLACK).size().x)
+        .sum();
+    assert!(galley.size().x < isolated, "{} vs isolated {isolated}", galley.size().x);
+    // Latin text is unaffected.
+    let latin = view.layout_no_wrap("Hello".to_owned(), FontId::proportional(13.0), Color32::BLACK);
+    let g = &latin.rows[0].glyphs;
+    assert!(g.windows(2).all(|w| w[0].pos.x < w[1].pos.x));
+}

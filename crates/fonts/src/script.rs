@@ -47,27 +47,28 @@ pub enum GlyphError {
     TooComplex,
 }
 
-struct Flatten {
-    contours: Vec<Vec<[f64; 2]>>,
+pub(crate) struct Flatten {
+    pub(crate) contours: Vec<Vec<[f64; 2]>>,
     cur: Vec<[f64; 2]>,
     scale: f64,
-    dx: f64,
+    pub(crate) dx: f64,
+    pub(crate) dy: f64,
     points: usize,
-    too_complex: bool,
+    pub(crate) too_complex: bool,
     max_points: usize,
 }
 
 impl Flatten {
-    fn new(scale: f64) -> Self {
-        Self { contours: Vec::new(), cur: Vec::new(), scale, dx: 0.0, points: 0, too_complex: false, max_points: 4096 }
+    pub(crate) fn new(scale: f64) -> Self {
+        Self { contours: Vec::new(), cur: Vec::new(), scale, dx: 0.0, dy: 0.0, points: 0, too_complex: false, max_points: 4096 }
     }
 
     fn pt(&self, x: f32, y: f32) -> [f64; 2] {
-        [self.dx + x as f64 * self.scale, y as f64 * self.scale]
+        [self.dx + x as f64 * self.scale, self.dy + y as f64 * self.scale]
     }
 
     fn last(&self) -> [f64; 2] {
-        self.cur.last().copied().unwrap_or([self.dx, 0.0])
+        self.cur.last().copied().unwrap_or([self.dx, self.dy])
     }
 
     fn push(&mut self, p: [f64; 2]) {
@@ -79,7 +80,7 @@ impl Flatten {
         self.cur.push(p);
     }
 
-    fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         if self.cur.len() > 2 {
             self.contours.push(std::mem::take(&mut self.cur));
         } else {

@@ -469,12 +469,15 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
             }
             egui::Frame::NONE.fill(Color32::WHITE).stroke(Stroke::new(1.5, ACCENT)).inner_margin(egui::Margin::symmetric(2, 0)).show(ui, |ui| {
                 let rows = ed.text.lines().count().max(1);
+                // Arabic (and other right-to-left) paragraphs read from the right edge.
+                let align = if pdfcraft_fonts::bidi::is_rtl_paragraph(&ed.text) { egui::Align::RIGHT } else { egui::Align::LEFT };
                 let r = ui.add(
                     egui::TextEdit::multiline(&mut ed.text)
                         .id(egui::Id::new("edit-text-line-input"))
                         .font(font.clone())
                         .text_color(text_color)
                         .frame(egui::Frame::NONE)
+                        .horizontal_align(align)
                         .desired_width(width)
                         .desired_rows(rows),
                 );
